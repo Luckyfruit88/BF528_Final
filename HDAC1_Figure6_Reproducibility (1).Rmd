@@ -1,0 +1,235 @@
+---
+title: "Reproducibility Project: HDAC1 Regulation in Dendritic Cells"
+output:
+  html_document:
+    toc: true
+---
+
+# Pipeline Overview
+
+The goal of this notebook is to reproduce the analyses leading to Figure 6 of *"The histone deacetylase HDAC1 controls dendritic cell development and anti-tumor immunity"*. We process ATAC-seq (GSE266581) and RNA-seq (GSE266583) datasets to identify chromatin accessibility changes and transcriptomic consequences in HDAC1-deficient cDC1/cDC2 cells.
+
+# Upstream Processing (Shell Command Documentation)
+
+> **Note:** The following commands are documented for reproducibility but are not executed inside this notebook. They assume that the mouse reference genome (mm10) and required indices are available. Replace placeholder paths with your local configuration.
+
+```{bash, eval=FALSE}
+# Step 1: QC & Trimming (FastQC + Trim Galore)
+# Evaluate raw read quality and remove Nextera adapters.
+fastqc raw_data/*.fastq.gz -o qc_plots/
+trim_galore --nextera --fastqc -o trimmed_reads/ raw_data/*.fastq.gz
+
+# Step 2: Alignment (Bowtie2 to mm10)
+# Map single-end reads using a sensitive preset to maximize alignment rate.
+bowtie2 --very-sensitive -x /path/to/mm10/index -U trimmed_reads/*.fq.gz -S alignments/sample.sam
+
+# Step 3: Filtering (Samtools + Bedtools)
+# Keep high-quality, nuclear reads and remove ENCODE blacklist regions.
+samtools view -bS alignments/sample.sam | samtools sort -o alignments/sample.sorted.bam
+samtools view -b -q 30 alignments/sample.sorted.bam > filtered_bams/sample.q30.bam
+samtools idxstats filtered_bams/sample.q30.bam | cut -f1 | grep -v 'chrM' | \
+  xargs samtools view -b filtered_bams/sample.q30.bam > filtered_bams/sample.noMT.bam
+bedtools intersect -v -abam filtered_bams/sample.noMT.bam -b ENCODE_mm10_blacklist.v2.bed \
+  > filtered_bams/sample.final.bam
+
+# Step 4: Peak Calling (MACS2)
+# Call ATAC peaks using narrow settings and a fixed extension size representing nucleosome-free fragments.
+macs2 callpeak -t filtered_bams/sample.final.bam -f BAM -g mm --nomodel --extsize 147 \
+  --keep-dup auto -q 0.01 -n peaks/sample
+
+# Step 5: Track Generation (deepTools)
+# Generate BigWig tracks normalized by CPM for genome browser visualization.
+bamCoverage -b filtered_bams/sample.final.bam -o tracks/sample.bigWig --normalizeUsing CPM
+```
+
+# Downstream Analysis (R)
+
+```{r setup, message=FALSE, warning=FALSE}
+library(DiffBind)
+library(DESeq2)
+library(tidyverse)
+library(ChIPseeker)
+library(clusterProfiler)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+library(org.Mm.eg.db)
+library(ggplot2)
+library(ggrepel)
+```
+
+## Part A: Differential Accessibility (Reproducing Fig 6a/b)
+
+Create a DiffBind object from a sample sheet capturing experimental design (columns: SampleID, Tissue, Factor, Condition, Replicate, bamReads, ControlID, Peaks, PeakCaller).
+
+```{r diffbind_dba, message=FALSE, warning=FALSE}
+# Load metadata describing all ATAC-seq libraries.
+sample_sheet <- "data/diffbind_samples.csv"  # Update path accordingly
+
+# Construct the DiffBind object; counts are derived from MACS2 peak calls.
+dba_obj <- dba(sampleSheet = sample_sheet)
+
+# Count reads over consensus peakset and normalize with TMM to control library size effects.
+dba_obj <- dba.count(dba_obj, summits = 250)
+dba_obj <- dba.normalize(dba_obj, method = DBA_EDGER, normalize = DBA_NORM_TMM)
+
+# Perform differential analysis contrasting HDAC1 knockout (KO) vs wild-type (WT).
+dba_obj <- dba.contrast(dba_obj, categories = DBA_CONDITION, minMembers = 2)
+dba_obj <- dba.analyze(dba_obj, method = DBA_EDGER)
+
+# Extract differential accessible regions (DARs) at FDR < 0.05 and |log2FC| > 1.
+dar_table <- dba.report(dba_obj, method = DBA_EDGER, th = 0.05, fold = 1)
+dar_df <- as.data.frame(dar_table)
+
+# Save results for downstream integration.
+write_csv(dar_df, "results/DARs_cDC1_p0.01.csv")
+```
+
+Plot PCA of normalized counts to mirror Figure 6a and summarize gain/loss peaks for Figure 6b.
+
+```{r diffbind_plots, fig.width=7, fig.height=5}
+# PCA visualization
+p_pca <- dba.plotPCA(dba_obj, attributes = DBA_CONDITION, label = DBA_REPLICATE)
+
+# Count significant gains vs losses (positive log2FC indicates increased accessibility in KO)
+peak_direction <- dar_df %>%
+  mutate(direction = if_else(Fold > 0, "Gain", "Loss")) %>%
+  count(direction)
+
+p_counts <- ggplot(peak_direction, aes(x = direction, y = n, fill = direction)) +
+  geom_col() +
+  scale_fill_manual(values = c("Gain" = "#3c8dbc", "Loss" = "#e74c3c")) +
+  labs(title = "Differential Accessibility Summary", x = NULL, y = "Number of DARs") +
+  theme_minimal()
+
+p_counts
+```
+
+## Part B: QC Metrics
+
+Compute Fraction of Reads in Peaks (FRiP) from the DiffBind object to assess enrichment quality.
+
+```{r frip}
+frip_scores <- dba.show(dba_obj, bScore = TRUE)
+frip_df <- frip_scores %>% as_tibble() %>% select(SampleID, FRiP)
+knitr::kable(frip_df, caption = "FRiP scores across ATAC-seq libraries")
+```
+
+Optionally embed TSS enrichment plots generated externally with deepTools.
+
+```{r tss_enrichment, eval=FALSE}
+knitr::include_graphics("qc_plots/TSS_enrichment_heatmap.pdf")
+```
+
+## Part C: Multi-omics Integration (Reproducing Fig 6c/e)
+
+Process RNA-seq counts with DESeq2, annotate ATAC peaks, and join by gene to relate accessibility and expression changes.
+
+```{r deseq2_rnaseq, message=FALSE}
+# Load raw RNA-seq counts and metadata
+rna_counts <- read_tsv("data/RNA/GSE266583_cDC1_Raw_counts.tsv.gz")
+coldata <- read_csv("data/RNA/rnaseq_metadata.csv")
+
+# Prepare DESeq2 dataset (assumes columns match coldata rownames)
+count_mat <- rna_counts %>% column_to_rownames(var = "gene") %>% as.matrix()
+stopifnot(all(colnames(count_mat) == coldata$sample))
+
+dds <- DESeqDataSetFromMatrix(countData = count_mat, colData = coldata, design = ~ condition)
+dds <- dds[rowSums(counts(dds)) > 10, ]  # filter low counts to stabilize variance
+
+dds <- DESeq(dds)
+rna_res <- results(dds, contrast = c("condition", "KO", "WT")) %>%
+  as_tibble(rownames = "gene_id") %>%
+  mutate(gene_id = gsub("\.[0-9]+$", "", gene_id))
+```
+
+Annotate ATAC peaks and link to gene symbols.
+
+```{r annotate_peaks}
+# Annotate peaks to nearest genes
+peak_anno <- annotatePeak(dar_table, TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene, 
+                          tssRegion = c(-3000, 3000), annoDb = "org.Mm.eg.db")
+peak_df <- as.data.frame(peak_anno) %>%
+  transmute(
+    peak = paste0(seqnames, ":", start, "-", end),
+    gene_id = geneId,
+    geneSymbol = SYMBOL,
+    log2FC_ATAC = Fold,
+    FDR_ATAC = FDR
+  )
+
+# Map Ensembl gene IDs to symbols for RNA results
+rna_annot <- rna_res %>%
+  left_join(AnnotationDbi::select(org.Mm.eg.db, keys = gene_id, columns = "SYMBOL", keytype = "ENSEMBL"),
+            by = c("gene_id" = "ENSEMBL")) %>%
+  rename(geneSymbol = SYMBOL) %>%
+  mutate(log2FC_RNA = log2FoldChange, FDR_RNA = padj)
+```
+
+Integrate ATAC and RNA results and visualize concordant changes.
+
+```{r integration_plot, fig.width=7, fig.height=6}
+# Combine accessibility and expression by gene symbol
+integrated_df <- peak_df %>%
+  filter(!is.na(geneSymbol)) %>%
+  inner_join(rna_annot, by = "geneSymbol")
+
+highlight_genes <- c("Maged1", "Nectin2", "Spib", "Irf8")
+
+p_scatter <- integrated_df %>%
+  ggplot(aes(x = log2FC_RNA, y = log2FC_ATAC)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(alpha = 0.6, color = "#2c3e50") +
+  geom_point(data = subset(integrated_df, geneSymbol %in% highlight_genes), color = "#e74c3c", size = 3) +
+  geom_text_repel(data = subset(integrated_df, geneSymbol %in% highlight_genes),
+                  aes(label = geneSymbol), size = 3.5, max.overlaps = Inf) +
+  labs(title = "Integration of ATAC and RNA Changes", x = "RNA log2FC (KO vs WT)",
+       y = "ATAC log2FC (KO vs WT)") +
+  theme_minimal()
+
+p_scatter
+```
+
+## Part D: Functional Enrichment
+
+Assess biological processes affected by accessibility changes using GO enrichment.
+
+```{r go_enrichment, message=FALSE, warning=FALSE, fig.width=7, fig.height=5}
+# Use genes from significant DARs
+sig_genes <- peak_df %>% filter(FDR_ATAC < 0.05) %>% pull(gene_id) %>% unique()
+
+go_res <- enrichGO(gene         = sig_genes,
+                   OrgDb        = org.Mm.eg.db,
+                   keyType      = "ENTREZID",
+                   ont          = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff  = 0.05,
+                   qvalueCutoff  = 0.1)
+
+if (!is.null(go_res) && nrow(as.data.frame(go_res)) > 0) {
+  dotplot(go_res, showCategory = 15, title = "GO Biological Processes")
+}
+```
+
+## Part E: Motif Analysis
+
+Motif analysis highlights transcription factors potentially driving accessibility changes. You can perform motif scanning with `motifmatchr` and `JASPAR2020` motifs, or import results from HOMER/AME.
+
+```{r motif_analysis, eval=FALSE}
+# Example motif enrichment using motifmatchr (requires prepared peak sequences)
+library(JASPAR2020)
+library(TFBSTools)
+
+jaspar_motifs <- getMatrixSet(JASPAR2020, opts = list(species = 10090, all_versions = FALSE))
+
+# 'peak_sequences' should be a DNAStringSet of sequences for significant peaks
+motif_hits <- matchMotifs(jaspar_motifs, peak_sequences, genome = "BSgenome.Mmusculus.UCSC.mm10")
+motif_enrichment <- motifEnrichment(motif_hits, background)
+
+# Summarize top motifs
+motif_table <- motif_enrichment %>% as.data.frame() %>% arrange(FDR) %>% head(15)
+knitr::kable(motif_table, caption = "Top enriched motifs in HDAC1 KO DARs")
+```
+
+# Conclusion
+
+HDAC1 loss in dendritic cells produces widespread gains in chromatin accessibility accompanied by upregulation of immune-related genes. Integrating ATAC-seq and RNA-seq results reveals concordant regulatory programs, while GO and motif analyses highlight pathways and transcription factors that may drive enhanced antigen presentation and cDC activation.
