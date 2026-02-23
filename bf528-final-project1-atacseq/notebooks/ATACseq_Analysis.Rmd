@@ -1,0 +1,39 @@
+---
+title: "ATAC-seq Analysis Report"
+author: "BF528 Final Project"
+date: "`r Sys.Date()`"
+output: html_document
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+source("functions.R")
+```
+
+# Section 1: QC discussion (FastQC + alignment stats)
+
+- Summarize per-sample FastQC quality metrics.
+- Report alignment and duplication statistics.
+
+# Section 2: 2x ATAC-seq QC metrics
+
+- TSS enrichment score.
+- Fragment size periodicity.
+
+# Section 3: Differential accessibility analysis (DiffBind/EdgeR)
+
+- Build consensus peak set.
+- Perform contrast: KO vs WT.
+
+# Section 4: Peak annotation (ChIPseeker)
+
+- Annotate peaks to genomic features.
+
+# Section 5: Motif enrichment (motifmatchr + JASPAR2020)
+
+- Identify enriched TF motifs in differential peaks.
+
+# Section 6: Reproduce Figure 6a-6f
+
+- Reproduce reference manuscript Figure 6 panels.

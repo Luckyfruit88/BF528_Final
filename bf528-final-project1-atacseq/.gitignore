@@ -1,0 +1,14 @@
+# Nextflow runtime cache
+work/
+.nextflow/
+.nextflow.log*
+
+# Large data files (do NOT commit to GitHub)
+data/
+ref/
+results/
+*.bam
+*.bai
+*.fastq.gz
+*.fq.gz
+*.bt2
